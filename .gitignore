@@ -1,0 +1,26 @@
+# ---- build outputs -------------------------------------------------
+*.class
+*.o
+*.obj
+*.exe
+*.dll
+*.a
+*.lib
+*.pdb
+
+# ---- generated test artifacts --------------------------------------
+# regenerate with: python tests/oracle.py > tests/expected.txt
+#                  java BigCalc < tests/exprs.txt  (see README)
+tests/actual.txt
+tests/actual_cpp.txt
+tests/expected.txt
+
+# ---- logs ----------------------------------------------------------
+*.log
+
+# ---- editors / OS --------------------------------------------------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini

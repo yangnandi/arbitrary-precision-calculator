@@ -1,0 +1,8 @@
+:time
+:digits 0
+ndigits(fact(100000))
+ndigits(fact(300000))
+ndigits(fib(1000000))
+ndigits(fib(10000000))
+ndigits(3^1000000)
+ndigits(7^1000000)
