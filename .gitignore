@@ -15,6 +15,12 @@ tests/actual.txt
 tests/actual_cpp.txt
 tests/expected.txt
 
+# ---- GPU kernel intermediate ---------------------------------------
+# cpp/gpu_ptx.h IS committed (the PTX is embedded in the executable, and
+# the build must work on machines with no CUDA Toolkit installed).
+# cpp/gpu_screen.ptx is just the nvcc step in between.
+cpp/gpu_screen.ptx
+
 # ---- logs ----------------------------------------------------------
 *.log
 

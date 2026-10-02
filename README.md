@@ -72,6 +72,102 @@ has been materialised:
 
 ---
 
+## C++/GMP v3 — multithreading + CUDA
+
+### First, what the benchmark actually found
+
+Threads were added, they worked, and they barely moved the needle. Profiling
+instead of guessing found the real problem elsewhere: `terminates()` tested
+whether a denominator was `2^a·5^b` by shifting and dividing **one factor at a
+time** — an O(d²) loop over a d-digit denominator. Every `pi(d)` and `e(d)`
+render paid it twice. Counting the factors with `mpz_scan1` and `mpz_remove`
+instead turns it into two O(1)/O(M(n)) calls:
+
+| | before | after | |
+| --- | --- | --- | --- |
+| `pi(200000)` | 16 043 ms | **269 ms** | **60×** |
+| `e(200000)` | 16 474 ms | **477 ms** | **35×** |
+| `pi(1000000)` | (did not finish in 6 min) | **4 041 ms** | — |
+
+That is where the time was. Everything below is measured after that fix.
+
+### Multithreading (`:threads N`, default = every core)
+
+GMP objects are never shared between threads; each task owns its own `mpz_class`.
+That is what makes this safe, since GMP is not internally synchronised.
+
+| Operation | How it is parallelised |
+| --- | --- |
+| `fact(n)` | product tree split into ~4×cores contiguous chunks, then combined pairwise |
+| `pi(d)` | Chudnovsky binary splitting cut into blocks; combining is `(P₁P₂, Q₁Q₂, Q₂T₁+P₁T₂)`, bit-identical to the sequential recursion |
+| `e(d)` | series split into blocks using `Σ N!/j! = (N!/hi!)·Σ hi!/j!` per block, tree-reduced |
+| decimal output > 2 M digits | divide-and-conquer split stays sequential, the leaf→ASCII step runs on all cores in batches |
+
+Xeon E5-2696 v4, 22 physical / 44 logical cores, best of 3:
+
+| operation | digits | 1 thread | 22 threads | 44 threads | 22× | 44× |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `fact(10⁶)` | 5 565 709 | 1 770 ms | 1 186 ms | 1 217 ms | 1.49× | 1.45× |
+| `pi(10⁶)` | 1 000 000 | 4 638 ms | 4 277 ms | 4 130 ms | 1.08× | **1.12×** |
+| `e(10⁶)` | 1 000 000 | 17 965 ms | 8 579 ms | 8 677 ms | **2.09×** | 2.07× |
+| `2^2·10⁷` (compute + render) | 6 020 600 | 1 452 ms | 1 100 ms | 1 163 ms | 1.32× | 1.25× |
+| `fib(3·10⁶)` (not parallelised) | 626 962 | 100 ms | 101 ms | 109 ms | 0.99× | 0.92× |
+
+**Why the numbers are modest, honestly.** These are binary-splitting trees, and
+the top of the tree is a *single* huge multiplication or division. With FFT
+multiplication each level up costs ~2.2× the one below, so the root is over half
+the total work — Amdahl caps `fact`/`pi` near 1.8× no matter how many cores you
+add. Going past that needs a *parallel* big-integer multiplier, which GMP does
+not have; that is a research-grade component, not a configuration knob. `e(d)`
+scales best because its per-block work is genuinely independent. More threads
+than physical cores (44 vs 22) buys nothing and occasionally costs a little.
+
+### CUDA (`:gpu`)
+
+An RTX 5060 Ti, driven **without the CUDA runtime**: nvcc compiles the kernel to
+PTX, `ptx_to_header.py` embeds it as a C string, and the executable resolves
+`nvcuda.dll` at run time and JITs it through the Driver API. The calculator stays
+a single MinGW-built binary with no import library and no MSVC-ABI DLL, and it
+builds and runs unchanged on machines with no CUDA Toolkit at all — it just
+reports the GPU as unavailable.
+
+**What belongs on the GPU, and what does not.** Arbitrary-precision arithmetic
+does not: the hot path is a chain of huge multiplications, GMP's speciality, and
+on a card that workload is latency- and bandwidth-bound rather than
+throughput-bound. What *is* embarrassingly parallel is screening one huge number
+against a very large table of small primes — millions of independent `n mod p`
+reductions with nothing flowing between them. That is the one kernel:
+
+```cuda
+// one thread per prime; Horner over the 32-bit limbs of the big number
+for (int j = nlimbs - 1; j >= 0; --j)
+    r = ((r << 32) | (unsigned)limbs[j]) % p;
+```
+
+It backs `smallfactor(n[, limit])` and the screen in front of `isprime()` for
+inputs over 50 digits. A hit is a proof of compositeness, so it can only help.
+
+Measured on `n = 2^521 − 1` (no small factor, so the whole prime table is swept):
+
+| limit | GPU | 44-thread CPU | speedup |
+| --- | ---: | ---: | ---: |
+| 10⁶ | 1.24 ms | 9.17 ms | **7.4×** |
+| 10⁷ | 2.34 ms | 10.15 ms | **4.3×** |
+| 4×10⁷ | 5.36 ms | 14.21 ms | **2.7×** |
+| 10⁸ | 8.43 ms | 23.09 ms | **2.7×** |
+
+`smallfactor` cross-checked against an independent Python reference on 71 inputs
+(including `2^521−1`, `2^127−1`, `2^89−1`, `10^200+357`): **0 mismatches**.
+
+### New commands
+
+```text
+:threads N        worker threads (no arg = show, 0 = auto)
+:gpu              on|off|info|bench [limit]
+```
+
+---
+
 用 **Java 25** 实现的任意精度计算器。所有数值都是基于 `BigInteger` 的**精确有理数**（分子/分母，始终约分、分母恒正），因此：
 
 - **没有任何位数限制**，也没有任何舍入误差；
