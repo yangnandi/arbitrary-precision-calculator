@@ -12,6 +12,66 @@
 
 ---
 
+## C++/GMP v2 — unrestricted sizes + streaming output
+
+The C++ implementation no longer caps anything in software. Exponents, digit
+counts, root indices and factorial arguments are carried as arbitrary-precision
+integers end to end, and every decimal is written out most-significant-digit
+first in chunks, flushed as it is produced.
+
+```text
+$ bigcalcgmp.exe
+> 2^9999999999999999999999999999999999999999999999
+error: (2)^(9999999999999999999999999999999999999999999999) would need about
+3010299956639811952137388947244930267681898815 decimal digits (1.249e45 bytes of
+binary value, before any output buffer), but this machine currently has 23.4 GiB of
+free RAM. Nothing in the calculator caps this -- it is the machine.
+Use :guard off to attempt it anyway.
+```
+
+That is the point: the 46-digit exponent is **accepted**, sized exactly up front,
+and the only thing that refuses it is physics. Anything that does fit now starts
+scrolling immediately instead of appearing only after the whole decimal string
+has been materialised:
+
+```text
+> 2^100000000
+  [  5.9%  1763849 / 30103000 digits]        <- stderr progress
+3684665936980458763209092390984221915069...   <- stdout, streaming
+```
+
+### What changed
+
+| Area | Before | v2 |
+| --- | --- | --- |
+| Exponent of `^` | had to fit `long` ("too large to materialise") | `mpz_class`, square-and-multiply past `unsigned long` |
+| `:digits N` | `int`, rejected above 10 000 000 | arbitrary precision; expansion streamed by long division |
+| `root(x,k,d)`, `pi(d)`, `e(d)` | `int` digits | arbitrary precision, checked against RAM only |
+| `fact(n)`, `fib(n)` | rejected past `unsigned long` | sized first, refused only when it cannot fit |
+| Output | `get_str()`, whole result in memory | divide-and-conquer MSB-first emitter, `fwrite`+flush per chunk |
+| Peak extra memory | one full copy of the result as ASCII (~2.4x the binary value) | one 64 Ki-digit chunk |
+| Long jobs | silent | progress meter on stderr above 2 000 000 digits |
+| OOM | `abort()` / Windows crash dialog | clean message and `exit 2` |
+
+### New commands
+
+```text
+:guard on|off     RAM feasibility pre-check (default on). "off" attempts anything.
+:progress on|off  streaming progress meter on stderr (default on)
+:mem              free RAM, how many digits fit, current settings, ans
+```
+
+### Verification
+
+* 29-case Python-oracle suite: **0 / 29** failures, unchanged.
+* Byte-for-byte against CPython: `2^100000000` (30 103 000 digits),
+  `2^1000000` (301 030), `fact(100000)` (456 574), `1/7` to 100 000 decimals.
+* 599 decimal/rounding outputs (`:digits` 0…500, `:frac on|off`, 23 fractions
+  including `9999/10000`, `-1/8`, `1/1024`, `1/125`, `5/9`, `-7/12`) against an
+  independent half-up reference: **0 mismatches**.
+
+---
+
 用 **Java 25** 实现的任意精度计算器。所有数值都是基于 `BigInteger` 的**精确有理数**（分子/分母，始终约分、分母恒正），因此：
 
 - **没有任何位数限制**，也没有任何舍入误差；
