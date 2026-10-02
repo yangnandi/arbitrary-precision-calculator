@@ -22,24 +22,33 @@
 //  * The only remaining limit is physical RAM. That is checked up front
 //    and reported in exact numbers. :guard off disables even that check.
 // ---------------------------------------------------------------------
-// v3 - multithreading + CUDA screening
+// v3 - multithreading, and an honest look at the GPU
 //
-//  * fact(n) runs a parallel product tree, pi(d) parallel binary splitting,
-//    e(d) block-parallel series, and decimal output above 2M digits converts
-//    its pieces on every core. :threads N controls the pool; GMP objects are
-//    never shared, which is what makes that safe.
-//    Measured speedups are modest (1.1x-2.1x) and that is expected: the top
-//    of a binary-splitting tree is a single huge GMP multiplication, which
-//    no amount of threading parallelises.
-//  * One CUDA kernel -- n mod p for millions of small primes at once --
-//    compiled to PTX by nvcc, embedded as a string, and JIT-ed at run time
-//    through nvcuda.dll via the Driver API. No CUDA runtime, no import
-//    library, still one MinGW-built executable. It backs smallfactor() and
-//    the screen in front of isprime(); on an RTX 5060 Ti it is 2.7x-7.4x
-//    faster than the 44-thread CPU sweep.
-//  * terminates()/printExactDecimal() no longer factor 2^a*5^b one exponent
-//    at a time. That loop was O(d^2) and dominated every pi(d)/e(d) render:
-//    pi(200000) went from 16.0 s to 0.27 s.
+//  * Two v3 mistakes, found by profiling rather than guessing:
+//      - the decimal renderer still used a block long division (O(scale*M(n)),
+//        strictly serial). For pi(1000000) it was 3.3 of the 4.2 seconds. One
+//        multiply plus one division restores O(M(n)): pi(1e6) 4208 -> 1114 ms.
+//      - parallelising only the leaves of the digit conversion was pointless,
+//        because the splitter recomputed 10^h at every node (~900 ms serial
+//        against 126 ms of parallel leaf work). Powers are now computed once
+//        per level, in parallel, and each level's divisions run in parallel.
+//    Program-reported parallel fraction went from 2-10% to 42-48% on the
+//    conversion-heavy operations; fact(1e6) 1823 -> 752 ms at 44 threads.
+//  * pi(d) still runs near one core and always will: after the above, 86% of
+//    pi(1000000) is four *single* GMP operations (10^k, a 2M-digit sqrt, a
+//    2M-by-1M division). There is no second thread to give them work.
+//  * One CUDA kernel -- n mod p for millions of small primes at once, one
+//    thread per prime, Horner over the number's 32-bit limbs. PTX embedded at
+//    build time, JIT-ed at run time through nvcuda.dll. It backs smallfactor()
+//    and wins 2.7x-7.4x over the 44-thread CPU sweep. The arithmetic core
+//    cannot go on the GPU: it is a chain of huge multiplications, which is
+//    GMP's speciality and latency/bandwidth-bound on a card.
+//  * A GPU candidate-window sieve for nextprime was written, verified correct,
+//    and then rejected on measurement -- it loses to mpz_nextprime at 10^300
+//    (259 ms vs 14 ms), 10^2000 and 10^8000, while the kernel contributes
+//    under a millisecond. It is off by default (:gpu nextprime on to try it).
+//  * :time now reports the parallel fraction and GPU kernel milliseconds, so
+//    "the GPU is barely moving" is answerable from the program itself.
 // ---------------------------------------------------------------------
 //
 // Build:
@@ -146,6 +155,21 @@ static BigInt truncQ(const Rat& q) { return q.get_num() / q.get_den(); }
 
 static unsigned g_threads = 0;        // 0 = auto (:threads 0)
 
+// Diagnostics: how much of the run actually happened inside parallel regions.
+// A speedup that "does not show up" is usually just a tiny parallel fraction,
+// and these counters say so instead of leaving it to guesswork.
+static std::atomic<unsigned long long> g_pfCalls{0};
+static std::atomic<unsigned long long> g_pfTasks{0};
+static std::atomic<unsigned long long> g_pfMicros{0};
+static std::atomic<unsigned> g_pfMaxThreads{0};
+
+static void pfReset() {
+    g_pfCalls.store(0);
+    g_pfTasks.store(0);
+    g_pfMicros.store(0);
+    g_pfMaxThreads.store(0);
+}
+
 static unsigned threadCount() {
     if (g_threads) return g_threads;
     unsigned n = std::thread::hardware_concurrency();
@@ -167,6 +191,7 @@ static void parallelFor(size_t n, F&& fn) {
     std::exception_ptr err;
     std::vector<std::thread> pool;
     pool.reserve(t);
+    auto t0 = std::chrono::steady_clock::now();
     for (unsigned w = 0; w < t; ++w) {
         pool.emplace_back([&] {
             try {
@@ -185,6 +210,14 @@ static void parallelFor(size_t n, F&& fn) {
         });
     }
     for (auto& th : pool) th.join();
+    auto t1 = std::chrono::steady_clock::now();
+    g_pfCalls.fetch_add(1, std::memory_order_relaxed);
+    g_pfTasks.fetch_add(n, std::memory_order_relaxed);
+    g_pfMicros.fetch_add(static_cast<unsigned long long>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()),
+            std::memory_order_relaxed);
+    unsigned prev = g_pfMaxThreads.load(std::memory_order_relaxed);
+    while (t > prev && !g_pfMaxThreads.compare_exchange_weak(prev, t)) {}
     if (err) std::rethrow_exception(err);
 }
 
@@ -397,6 +430,10 @@ static BigInt digitsOfFibonacci(const BigInt& n) {
 #endif
 
 static bool g_useGpu = true;          // :gpu on|off
+
+// Device milliseconds actually spent in kernels, reported by :time so the GPU
+// is not a black box.
+static std::atomic<unsigned long long> g_gpuMicros{0};
 
 #if defined(BIGCALC_EMBEDDED_PTX)
 
@@ -633,9 +670,132 @@ static unsigned long long gpuSmallestFactor(const BigInt& n, unsigned long long 
 #endif
 }
 
-// CPU equivalent, used to benchmark against the GPU and as the fallback.
-static unsigned long long cpuSmallestFactor(const BigInt& n, unsigned long long limit) {
+// n mod p for every prime p <= limit, straight off the GPU. This is the
+// workhorse the prime search is built on: the residues are what turn
+// "is n+d divisible by p" into "is d congruent to -n mod p".
+static bool gpuResidues(const BigInt& n, unsigned long long limit,
+                        std::vector<unsigned int>& out, std::string* why) {
+#if defined(BIGCALC_EMBEDDED_PTX)
+    cuda::Session& S = cuda::session();
+    if (!S.ok) { if (why) *why = S.why; return false; }
+    cuda::Api& A = cuda::api();
+
     const std::vector<unsigned int>& primes = primeTable(limit);
+    if (primes.empty()) { if (why) *why = "no primes in range"; return false; }
+
+    BigInt a = n < 0 ? -n : n;
+    size_t nlimbs = (mpz_sizeinbase(a.get_mpz_t(), 2) + 31) / 32;
+    if (nlimbs == 0) nlimbs = 1;
+    std::vector<unsigned int> limbs(nlimbs, 0);
+    size_t got = 0;
+    mpz_export(limbs.data(), &got, -1, sizeof(unsigned int), 0, 0, a.get_mpz_t());
+    size_t useLimbs = got ? got : 1;
+
+    cuda::CUdeviceptr dLimbs = 0, dPrimes = 0, dRes = 0, dFound = 0;
+    size_t limbBytes = useLimbs * sizeof(unsigned int);
+    size_t primeBytes = primes.size() * sizeof(unsigned int);
+    if (A.MemAlloc(&dLimbs, limbBytes) != 0) { if (why) *why = "cuMemAlloc(limbs) failed"; return false; }
+    if (A.MemAlloc(&dPrimes, primeBytes) != 0) {
+        A.MemFree(dLimbs); if (why) *why = "cuMemAlloc(primes) failed"; return false;
+    }
+    if (A.MemAlloc(&dRes, primeBytes) != 0) {
+        A.MemFree(dLimbs); A.MemFree(dPrimes);
+        if (why) *why = "cuMemAlloc(res) failed";
+        return false;
+    }
+    if (A.MemAlloc(&dFound, sizeof(unsigned int)) != 0) {
+        A.MemFree(dLimbs); A.MemFree(dPrimes); A.MemFree(dRes);
+        if (why) *why = "cuMemAlloc(found) failed";
+        return false;
+    }
+
+    A.MemcpyHtoD(dLimbs, limbs.data(), limbBytes);
+    A.MemcpyHtoD(dPrimes, primes.data(), primeBytes);
+    unsigned int none = 0xFFFFFFFFu;
+    A.MemcpyHtoD(dFound, &none, sizeof(none));
+
+    int nlimbsI = static_cast<int>(useLimbs);
+    int nprimesI = static_cast<int>(primes.size());
+    void* args[] = { &dLimbs, &nlimbsI, &dPrimes, &nprimesI, &dRes, &dFound };
+    unsigned threads = 256;
+    unsigned blocks = static_cast<unsigned>((primes.size() + threads - 1) / threads);
+
+    auto t0 = std::chrono::steady_clock::now();
+    cuda::CUresult r = A.LaunchKernel(S.kModSmall, blocks, 1, 1, threads, 1, 1, 0, nullptr, args, nullptr);
+    if (r == 0) r = A.CtxSynchronize();
+    auto t1 = std::chrono::steady_clock::now();
+    g_gpuMicros.fetch_add(static_cast<unsigned long long>(
+            std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count()),
+            std::memory_order_relaxed);
+
+    if (r != 0) {
+        A.MemFree(dLimbs); A.MemFree(dPrimes); A.MemFree(dRes); A.MemFree(dFound);
+        if (why) *why = "kernel failed: " + cuda::errName(r);
+        return false;
+    }
+    out.resize(primes.size());
+    A.MemcpyDtoH(out.data(), dRes, primeBytes);
+    A.MemFree(dLimbs); A.MemFree(dPrimes); A.MemFree(dRes); A.MemFree(dFound);
+    if (why) why->clear();
+    return true;
+#else
+    (void)n; (void)limit; (void)out;
+    if (why) *why = "built without an embedded PTX kernel";
+    return false;
+#endif
+}
+
+// Find the smallest prime > n by sieving a window of candidates against the
+// small primes. The GPU supplies n mod p for the whole table in one launch;
+// the CPU then only has to mark multiples inside the window -- a few hundred
+// thousand operations -- and run Miller-Rabin on the very few survivors.
+//
+// MEASURED AND REJECTED AS A DEFAULT. Against GMP's mpz_nextprime this loses
+// at every size tried, and the GPU kernel is not the reason (it contributes
+// under a millisecond in all of them):
+//
+//     n         this sieve     mpz_nextprime
+//     10^300      259 ms          14 ms
+//     10^2000      14.7 s         13.5 s
+//     10^8000     516 s          402 s
+//
+// The bottleneck is Miller-Rabin on the survivors, not the small-prime screen,
+// and GMP already screens candidates well before its own test. So this stays
+// available behind :gpu nextprime on for experiments, but off by default --
+// shipping a slower default path would be worse than not shipping it at all.
+static bool g_gpuNextPrime = false;
+static BigInt nextPrimeGpu(const BigInt& n, unsigned long long limit, std::string* why) {
+    std::vector<unsigned int> res;
+    if (!gpuResidues(n, limit, res, why)) return BigInt(0);
+    if (res.empty()) return BigInt(0);
+
+    const std::vector<unsigned int>& primes = primeTable(limit);
+    // Expected gap near n is about ln(n); take a wide margin, cap the window.
+    double lnn = 2.302585092994046 * static_cast<double>(decimalLength(n)) + 8.0;
+    unsigned long long W = static_cast<unsigned long long>(lnn * 64.0) + 4096ULL;
+    if (W > 8000000ULL) W = 8000000ULL;
+
+    std::vector<bool> comp(static_cast<size_t>(W) + 2, false);
+    for (size_t i = 0; i < primes.size(); ++i) {
+        unsigned long long p = primes[i];
+        unsigned long long r = res[i];
+        unsigned long long d = (p - r) % p;      // (n + d) % p == 0
+        if (d == 0) d = p;                       // n itself is the multiple
+        for (; d <= W; d += p) comp[static_cast<size_t>(d)] = true;
+    }
+
+    BigInt cand;
+    for (unsigned long long d = 1; d <= W; ++d) {
+        if (comp[static_cast<size_t>(d)]) continue;
+        cand = n + BigInt(static_cast<unsigned long>(d));
+        if (mpz_probab_prime_p(cand.get_mpz_t(), 25)) return cand;
+    }
+    if (why) *why = "no prime found inside the window";
+    return BigInt(0);
+}
+
+// CPU equivalent, used to benchmark against the GPU and as the fallback.
+static unsigned long long cpuSmallestFactor(const BigInt& n, unsigned long long limit) {    const std::vector<unsigned int>& primes = primeTable(limit);
     BigInt a = n < 0 ? -n : n;
     size_t np = primes.size();
     if (np == 0) return 0;
@@ -739,25 +899,56 @@ static void streamIntDigits(BigInt x, size_t nd) {
     streamIntDigits(std::move(r), h);
 }
 
-// Split x into `k` pieces of roughly equal digit counts, in output order.
-static void splitPieces(BigInt x, size_t nd, size_t k,
-                        std::vector<BigInt>& out, std::vector<size_t>& counts) {
-    if (k <= 1 || nd <= STREAM_CHUNK) {
-        counts.push_back(nd);
-        out.push_back(std::move(x));
-        return;
+// Split x into 2^levels pieces of roughly equal digit counts, in output order.
+//
+// This is the version worth using on many cores. The recursive splitter above
+// recomputes 10^h from scratch at every node, which measured at ~900 ms for a
+// 5.5-million-digit factorial and was entirely serial -- the parallel leaf
+// conversion was only 126 ms next to it. Here:
+//
+//   * every level's power of ten is computed once, and all the levels'
+//     powers are computed in parallel (they are independent);
+//   * each level's divisions are independent, so they run in parallel too.
+//
+// All pieces at a level have either A or A+1 digits where A = nd >> level, so
+// the split point is A>>1 or (A>>1)+1 -- one cached power, times ten if needed.
+static void splitPiecesLevels(const BigInt& x, size_t nd, size_t levels,
+                              std::vector<BigInt>& out, std::vector<size_t>& counts) {
+    std::vector<BigInt> powers(levels);
+    parallelFor(levels, [&](size_t L) {
+        size_t h = nd >> (L + 1);
+        if (h) powers[L] = pow10Big(bytesBig(h));
+    });
+
+    std::vector<BigInt> cur;
+    std::vector<size_t> curD;
+    cur.push_back(x);
+    curD.push_back(nd);
+    for (size_t L = 0; L < levels; ++L) {
+        size_t n = cur.size();
+        std::vector<BigInt> nxt(n * 2);
+        std::vector<size_t> nxtD(n * 2, 0);
+        size_t base = nd >> (L + 1);
+        parallelFor(n, [&](size_t i) {
+            size_t d = curD[i];
+            size_t h = d >> 1;                      // low half
+            if (h == 0) { nxt[2 * i] = std::move(cur[i]); nxtD[2 * i] = d; return; }
+            const BigInt& P = powers[L];
+            BigInt p10;
+            if (h != base) { p10 = P * 10; }         // the A+1-digit case
+            const BigInt& p = (h != base) ? p10 : P;
+            BigInt q, r;
+            mpz_tdiv_qr(q.get_mpz_t(), r.get_mpz_t(), cur[i].get_mpz_t(), p.get_mpz_t());
+            nxt[2 * i] = std::move(q);
+            nxtD[2 * i] = d - h;
+            nxt[2 * i + 1] = std::move(r);
+            nxtD[2 * i + 1] = h;
+        });
+        cur = std::move(nxt);
+        curD = std::move(nxtD);
     }
-    size_t highK = k / 2;
-    size_t lowK = k - highK;
-    size_t h = static_cast<size_t>((static_cast<unsigned long long>(nd) * lowK) / k);
-    if (h == 0) h = 1;
-    if (h >= nd) h = nd - 1;
-    BigInt p = pow10Big(BigInt(static_cast<unsigned long>(h)));
-    BigInt q, r;
-    mpz_tdiv_qr(q.get_mpz_t(), r.get_mpz_t(), x.get_mpz_t(), p.get_mpz_t());
-    BigInt().swap(p);
-    splitPieces(std::move(q), nd - h, highK, out, counts);
-    splitPieces(std::move(r), h, lowK, out, counts);
+    out = std::move(cur);
+    counts = std::move(curD);
 }
 
 // Zero-padded decimal of one piece. Pure function, safe on any thread.
@@ -773,195 +964,88 @@ static std::string paddedString(const BigInt& x, size_t nd) {
     return s;
 }
 
+// Emit exactly `nd` decimal digits of `a`, zero padded on the left.
+// Above a couple of million digits the conversion is worth splitting: the
+// divide-and-conquer cut stays sequential (each cut needs its parent), but the
+// leaf-to-ASCII step runs on every core. Pieces are converted in batches of
+// `threads`, so the extra buffer is a fraction of the result, not a whole copy.
+static void streamDigitsPadded(BigInt a, size_t nd) {
+    if (nd == 0) return;
+    if (a == 0) { emitZeros(nd); return; }
+    unsigned t = threadCount();
+    if (t > 1 && nd > 1000000) {
+        // Pick the number of halving levels so that there are several pieces
+        // per core, without letting the pieces get smaller than a chunk.
+        size_t levels = 0;
+        while ((static_cast<size_t>(1) << (levels + 1)) <= static_cast<size_t>(t) * 4
+               && (nd >> (levels + 1)) >= STREAM_CHUNK) {
+            ++levels;
+        }
+        if (levels > 0) {
+            std::vector<BigInt> pieces;
+            std::vector<size_t> counts;
+            splitPiecesLevels(a, nd, levels, pieces, counts);
+            std::vector<std::string> bufs(t);
+            for (size_t base = 0; base < pieces.size(); base += t) {
+                size_t m = pieces.size() - base;
+                if (m > t) m = t;
+                parallelFor(m, [&](size_t i) {
+                    bufs[i] = paddedString(pieces[base + i], counts[base + i]);
+                });
+                for (size_t i = 0; i < m; ++i) {
+                    emitRaw(bufs[i].data(), bufs[i].size());
+                    std::string().swap(bufs[i]);
+                }
+            }
+            return;
+        }
+    }
+    streamIntDigits(std::move(a), nd);
+}
+
 static void streamIntegerValue(const BigInt& v, bool sign) {
     BigInt a = v < 0 ? -v : v;
     size_t nd = decimalLength(a);
     if (sign && v < 0) emitRaw("-", 1);
-
-    // Above a couple of million digits the conversion is worth splitting:
-    // the divide-and-conquer split stays sequential (each cut needs its
-    // parent), but the leaf-to-ASCII step runs on every core. Pieces are
-    // converted in batches of `threads`, so the extra buffer is about a
-    // quarter of the result, not a whole copy of it.
-    unsigned t = threadCount();
-    if (t > 1 && nd > 2000000) {
-        size_t k = static_cast<size_t>(t) * 4;
-        std::vector<BigInt> pieces;
-        std::vector<size_t> counts;
-        pieces.reserve(k);
-        counts.reserve(k);
-        splitPieces(std::move(a), nd, k, pieces, counts);
-        std::vector<std::string> bufs(t);
-        for (size_t base = 0; base < pieces.size(); base += t) {
-            size_t m = pieces.size() - base;
-            if (m > t) m = t;
-            parallelFor(m, [&](size_t i) {
-                bufs[i] = paddedString(pieces[base + i], counts[base + i]);
-            });
-            for (size_t i = 0; i < m; ++i) {
-                emitRaw(bufs[i].data(), bufs[i].size());
-                std::string().swap(bufs[i]);
-            }
-        }
-        return;
-    }
-
-    streamIntDigits(std::move(a), nd);
-}
-
-// Holds back a trailing run of 9s so that a half-up carry can be applied
-// after the fact. Only the run of 9s is buffered, never the whole number.
-class NinesHold {
-public:
-    explicit NinesHold() {}
-    void put(char c) {
-        ++g_emitted;
-        if (c == '9') { held_.push_back('9'); progressTick(false); return; }
-        flushHeld();
-        prev_ = c;
-        has_ = true;
-        progressTick(false);
-    }
-    void finish(bool roundUp) {
-        if (!has_) {
-            // Every digit was a 9 and no earlier digit was held back, so there
-            // is no prev_ to emit -- emitting one would prepend a spurious 0
-            // (0.9999 would come out as 0.09999).
-            if (roundUp) {
-                std::cout.put('1');
-                for (size_t i = 0; i < held_.size(); ++i) std::cout.put('0');
-            } else if (!held_.empty()) {
-                std::cout.write(held_.data(), static_cast<std::streamsize>(held_.size()));
-            }
-            held_.clear();
-            std::cout.flush();
-            return;
-        }
-        if (roundUp) {
-            std::cout.put(static_cast<char>(prev_ + 1));
-            for (size_t i = 0; i < held_.size(); ++i) std::cout.put('0');
-        } else {
-            std::cout.put(prev_);
-            if (!held_.empty()) {
-                std::cout.write(held_.data(), static_cast<std::streamsize>(held_.size()));
-            }
-        }
-        held_.clear();
-        std::cout.flush();
-    }
-private:
-    void flushHeld() {
-        if (has_) std::cout.put(prev_);
-        if (!held_.empty()) {
-            std::cout.write(held_.data(), static_cast<std::streamsize>(held_.size()));
-            held_.clear();
-        }
-    }
-    std::string held_;
-    char prev_ = '0';
-    bool has_ = false;
-};
-
-static void holdPadded(NinesHold& hold, const BigInt& q, size_t k) {
-    static std::vector<char> b;
-    if (b.size() < k + 8) b.resize(k + 8);
-    mpz_get_str(b.data(), 10, q.get_mpz_t());
-    size_t actual = std::strlen(b.data());       // not mpz_sizeinbase: that may be +1
-    if (actual > k) actual = k;
-    for (size_t i = 0; i < k - actual; ++i) hold.put('0');
-    for (size_t i = 0; i < actual; ++i) hold.put(b[i]);
-}
-
-// Long division, `count` digits, generated in blocks. Never builds the
-// scaled numerator, so the memory cost is independent of `count`.
-static void streamFractionDigits(const BigInt& num, const BigInt& den,
-                                 unsigned long long count, bool roundUp) {
-    NinesHold hold;
-    if (count == 0) { hold.finish(false); return; }
-
-    BigInt rem;
-    mpz_tdiv_r(rem.get_mpz_t(), num.get_mpz_t(), den.get_mpz_t());
-    if (rem == 0) {
-        for (unsigned long long i = 0; i < count; ++i) hold.put('0');
-        hold.finish(false);
-        return;
-    }
-
-    const unsigned long long BLOCK = 1000;
-    BigInt blow;
-    mpz_ui_pow_ui(blow.get_mpz_t(), 10UL, static_cast<unsigned long>(BLOCK));
-    BigInt small;
-    unsigned long long left = count;
-    while (left > 0) {
-        unsigned long long k = left < BLOCK ? left : BLOCK;
-        BigInt mul = blow;
-        if (k != BLOCK) {
-            mpz_ui_pow_ui(mul.get_mpz_t(), 10UL, static_cast<unsigned long>(k));
-        }
-        BigInt scaled = rem * mul;
-        BigInt q, r2;
-        mpz_tdiv_qr(q.get_mpz_t(), r2.get_mpz_t(), scaled.get_mpz_t(), den.get_mpz_t());
-        rem.swap(r2);
-        holdPadded(hold, q, static_cast<size_t>(k));
-        left -= k;
-    }
-    hold.finish(roundUp);
-}
-
-// Is  (num mod den) * 10^scale  congruent to 10^scale - 1  times den?
-// i.e. are all `scale` fraction digits 9?  Only asked when it could matter.
-static bool fractionIsAllNines(const BigInt& num, const BigInt& den, const BigInt& scale) {
-    BigInt N;
-    mpz_tdiv_r(N.get_mpz_t(), num.get_mpz_t(), den.get_mpz_t());
-    if (N == 0) return false;
-    size_t dd = decimalLength(den);
-    if (scale >= BigInt(static_cast<unsigned long>(dd))) {
-        // 10^scale > den, so (den-N)*10^scale >= 10^scale > den
-        return false;
-    }
-    BigInt p10 = pow10Big(scale);
-    return (den - N) * p10 <= den;
-}
-
-// Does num/den round up (half away from zero) at `scale` decimals?
-static bool roundsUpAt(const BigInt& num, const BigInt& den, const BigInt& scale) {
-    BigInt N;
-    mpz_tdiv_r(N.get_mpz_t(), num.get_mpz_t(), den.get_mpz_t());
-    if (N == 0) return false;
-    BigInt ten(10), t;
-    mpz_powm(t.get_mpz_t(), ten.get_mpz_t(), scale.get_mpz_t(), den.get_mpz_t());
-    BigInt rem = (N * t) % den;
-    return 2 * rem >= den;
+    streamDigitsPadded(std::move(a), nd);
 }
 
 // Print v to `scale` decimals, half-up, streaming. Matches the old
 // toDecimal() digit for digit.
+//
+// This used to render the fraction with a block long division -- one division
+// per 1000 digits -- because that avoided materialising the scaled numerator.
+// The price was O(scale * M(n)) and it is strictly serial: for pi(1000000) it
+// was 3.3 of the 4.2 seconds and it pinned a single core. One multiply plus one
+// division is O(M(n)), and the resulting integer then goes through the parallel
+// digit streamer like every other integer.
 static void printRoundedDecimal(const Rat& v, unsigned long long scale) {
     BigInt num = v.get_num();
     bool neg = num < 0;
     if (neg) num = -num;
     BigInt den = v.get_den();
-    BigInt scaleZ(static_cast<unsigned long>(scale));
 
-    BigInt intPart = num / den;
-    bool roundUp = roundsUpAt(num, den, scaleZ);
-    bool carry = scale > 0 && roundUp && fractionIsAllNines(num, den, scaleZ);
-    if (carry) intPart += 1;
+    BigInt p10 = scale ? pow10Big(bytesBig(scale)) : BigInt(1);
+    BigInt scaled, rem;
+    {
+        BigInt big = num * p10;
+        mpz_tdiv_qr(scaled.get_mpz_t(), rem.get_mpz_t(), big.get_mpz_t(), den.get_mpz_t());
+    }
+    if (2 * rem >= den) scaled += 1;              // half away from zero
+
+    BigInt ip, fp;
+    if (scale == 0) { ip = scaled; fp = 0; }
+    else mpz_tdiv_qr(ip.get_mpz_t(), fp.get_mpz_t(), scaled.get_mpz_t(), p10.get_mpz_t());
 
     g_emitted = 0;
-    g_totalDigits = static_cast<unsigned long long>(decimalLength(intPart))
+    g_totalDigits = static_cast<unsigned long long>(decimalLength(ip))
                   + (scale ? scale + 1 : 0);
     if (neg) emitRaw("-", 1);
-    streamIntegerValue(intPart, false);
+    size_t ipd = decimalLength(ip);
+    streamDigitsPadded(std::move(ip), ipd);
     if (scale > 0) {
         emitRaw(".", 1);
-        if (carry) {
-            // rounding pushed the whole fraction up into the integer part, so
-            // the fraction is exactly `scale` zeros
-            emitZeros(static_cast<size_t>(scale));
-        } else {
-            streamFractionDigits(num, den, scale, roundUp);
-        }
+        streamDigitsPadded(std::move(fp), static_cast<size_t>(scale));
     }
     progressDone();
 }
@@ -974,44 +1058,54 @@ static void printExactDecimal(const Rat& v) {
     if (neg) num = -num;
     BigInt den = v.get_den();
 
-    // Same trick as terminates(): factor 10^a out of the denominator with one
-    // scan and one shift, and get the 5-count from mpz_remove, rather than
-    // looping O(size) divisions per factor.
+    // den = 2^twos * 5^fives: one scan plus one mpz_remove, not a loop.
     BigInt t = den;
-    unsigned long twos = den == 0 ? 0UL : static_cast<unsigned long>(mpz_scan1(t.get_mpz_t(), 0));
+    unsigned long twos = static_cast<unsigned long>(mpz_scan1(t.get_mpz_t(), 0));
     if (twos) t >>= twos;
     BigInt five(5), tOut;
     unsigned long fives = static_cast<unsigned long>(
             mpz_remove(tOut.get_mpz_t(), t.get_mpz_t(), five.get_mpz_t()));
-    unsigned long long scale = static_cast<unsigned long long>(std::max(twos, fives));
+    unsigned long long scale = std::max<unsigned long long>(twos, fives);
 
-    BigInt intPart = num / den;
+    BigInt p10 = scale ? pow10Big(bytesBig(scale)) : BigInt(1);
+    BigInt scaled;                                // num * 10^scale / den, exact
+    if (scale == 0) scaled = num;
+    else {
+        BigInt big = num * p10;
+        mpz_tdiv_q(scaled.get_mpz_t(), big.get_mpz_t(), den.get_mpz_t());
+    }
 
-    // scaled = num * 10^scale / den exactly; its trailing decimal zeros are
-    // min(v2, v5), which lets the tail be trimmed without building it.
-    BigInt tmp = num;
+    // `scaled` ends in min(v2, v5) zeros; knowing that lets the tail be
+    // trimmed without building the fraction first.
     unsigned long long v2 = 0, v5 = 0;
-    if (tmp != 0) {
-        v2 = static_cast<unsigned long long>(mpz_scan1(tmp.get_mpz_t(), 0));
-        BigInt five(5), out;
-        v5 = static_cast<unsigned long long>(mpz_remove(out.get_mpz_t(), tmp.get_mpz_t(),
-                                                         five.get_mpz_t()));
+    if (num != 0) {
+        v2 = static_cast<unsigned long long>(mpz_scan1(num.get_mpz_t(), 0));
+        BigInt f2(5), o2;
+        v5 = static_cast<unsigned long long>(
+                mpz_remove(o2.get_mpz_t(), num.get_mpz_t(), f2.get_mpz_t()));
     }
     unsigned long long z2 = v2 + (scale - static_cast<unsigned long long>(twos));
     unsigned long long z5 = v5 + (scale - static_cast<unsigned long long>(fives));
     unsigned long long tz = z2 < z5 ? z2 : z5;
     if (tz > scale) tz = scale;
-
     unsigned long long frac = scale - tz;
 
+    BigInt ip, fp;
+    if (scale == 0) { ip = scaled; fp = 0; }
+    else {
+        mpz_tdiv_qr(ip.get_mpz_t(), fp.get_mpz_t(), scaled.get_mpz_t(), p10.get_mpz_t());
+        if (tz > 0) fp /= pow10Big(bytesBig(tz));
+    }
+
     g_emitted = 0;
-    g_totalDigits = static_cast<unsigned long long>(decimalLength(intPart))
+    g_totalDigits = static_cast<unsigned long long>(decimalLength(ip))
                   + (frac ? frac + 1 : 0);
     if (neg) emitRaw("-", 1);
-    streamIntegerValue(intPart, false);
+    size_t ipd = decimalLength(ip);
+    streamDigitsPadded(std::move(ip), ipd);
     if (frac > 0) {
         emitRaw(".", 1);
-        streamFractionDigits(num, den, frac, false);
+        streamDigitsPadded(std::move(fp), static_cast<size_t>(frac));
     }
     progressDone();
 }
@@ -1792,6 +1886,15 @@ Rat Engine::call(const std::string& name, const std::vector<Rat>& a) {
         arity(name, a, 1);
         if (!isInteger(a[0])) throw CalcError("nextprime requires an integer");
         BigInt n = a[0].get_num();
+        if (n < 2) return Rat(2);
+        // On big inputs, optionally sieve a candidate window against the
+        // small-prime table on the GPU. Off by default: measured slower than
+        // mpz_nextprime, see the note above nextPrimeGpu().
+        if (g_useGpu && g_gpuNextPrime && decimalLength(n) > 30) {
+            std::string why;
+            BigInt g = nextPrimeGpu(n, 1000000ULL, &why);
+            if (g > n) return Rat(g);
+        }
         BigInt r;
         mpz_nextprime(r.get_mpz_t(), n.get_mpz_t());
         return Rat(r);
@@ -2011,12 +2114,10 @@ int main() {
                             throw CalcError(":threads " + n.get_str() + " is not a thread count");
                         }
                         unsigned long v2 = n.get_ui();
-                        unsigned hw = std::thread::hardware_concurrency();
-                        if (v2 > 1024) throw CalcError(":threads capped at 1024 (got " + n.get_str() + ")");
                         g_threads = static_cast<unsigned>(v2);
                         std::cout << "threads = " << threadCount()
                                   << (g_threads ? "" : " (auto)")
-                                  << "  (max " << hw << ")\n";
+                                  << "  (max " << std::thread::hardware_concurrency() << ")\n";
                     }
                 }
                 else if (cmd == "gpu") {
@@ -2041,6 +2142,11 @@ int main() {
                     }
                     else if (sub == "on") { g_useGpu = true; std::cout << "gpu on\n"; }
                     else if (sub == "off") { g_useGpu = false; std::cout << "gpu off\n"; }
+                    else if (sub == "nextprime") {
+                        g_gpuNextPrime = !g_gpuNextPrime;
+                        std::cout << "gpu nextprime " << (g_gpuNextPrime ? "on" : "off")
+                                  << "  (measured slower than mpz_nextprime; see source)\n";
+                    }
                     else if (sub.rfind("bench", 0) == 0) {
                         BigInt n = engine.last.get_num();
                         if (n < 0) n = -n;
@@ -2073,7 +2179,7 @@ int main() {
                         if (mg > 0 && mc > 0) std::cout << "  speedup: " << (mc / mg) << "x\n";
                         if (fg != fc) std::cout << "  ** MISMATCH between GPU and CPU results **\n";
                     }
-                    else throw CalcError(":gpu takes on|off|info|bench [limit]");
+                    else throw CalcError(":gpu takes on|off|info|nextprime|bench [limit]");
                 }
                 else if (cmd == "guard") {
                     if (arg.empty()) g_guard = !g_guard;
@@ -2157,6 +2263,7 @@ int main() {
             continue;
         }
 
+        pfReset();
         auto start = std::chrono::steady_clock::now();
         try {
             Rat v = engine.evaluate(line);
@@ -2165,7 +2272,25 @@ int main() {
             if (engine.timing) {
                 double ms = std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - start).count();
-                std::cout << "  [" << std::fixed << std::setprecision(1) << ms << " ms]\n";
+                std::cout << "  [" << std::fixed << std::setprecision(1) << ms << " ms";
+                unsigned long long calls = g_pfCalls.load();
+                if (calls) {
+                    double parMs = static_cast<double>(g_pfMicros.load()) / 1000.0;
+                    std::cout << "  | parallel regions: " << calls << " calls, "
+                              << g_pfTasks.load() << " tasks, " << std::setprecision(1)
+                              << parMs << " ms wall on " << g_pfMaxThreads.load()
+                              << " threads = " << std::setprecision(1)
+                              << (100.0 * parMs / (ms > 0 ? ms : 1.0))
+                              << "% of the run";
+                } else {
+                    std::cout << "  | no parallel regions";
+                }
+                unsigned long long gm = g_gpuMicros.load();
+                if (gm) {
+                    std::cout << "  | GPU kernels: " << std::setprecision(1)
+                              << (static_cast<double>(gm) / 1000.0) << " ms";
+                }
+                std::cout << "]\n";
             }
         }
         catch (const CalcError& ex) { std::cout << "error: " << ex.what() << '\n'; }

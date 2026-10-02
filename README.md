@@ -72,99 +72,125 @@ has been materialised:
 
 ---
 
-## C++/GMP v3 — multithreading + CUDA
+## C++/GMP v3 — multithreading, and an honest look at the GPU
 
-### First, what the benchmark actually found
+### What v2 got wrong, and what the profiler said
 
-Threads were added, they worked, and they barely moved the needle. Profiling
-instead of guessing found the real problem elsewhere: `terminates()` tested
-whether a denominator was `2^a·5^b` by shifting and dividing **one factor at a
-time** — an O(d²) loop over a d-digit denominator. Every `pi(d)` and `e(d)`
-render paid it twice. Counting the factors with `mpz_scan1` and `mpz_remove`
-instead turns it into two O(1)/O(M(n)) calls:
+v3 first added threads and a CUDA kernel, and both "worked" while barely changing
+anything. Measuring instead of guessing found two separate mistakes.
+
+**1. The decimal renderer was the bottleneck, and it was serial.** v2 replaced the
+original exact-decimal writer with a block long division, to avoid materialising the
+scaled numerator. That costs O(scale·M(n)) instead of O(M(n)) and pinned one core:
+for `pi(1000000)` it was **3.3 of the 4.2 seconds**. One multiply plus one division
+restores O(M(n)), and the resulting integer goes through the parallel digit streamer
+like any other:
 
 | | before | after | |
-| --- | --- | --- | --- |
-| `pi(200000)` | 16 043 ms | **269 ms** | **60×** |
-| `e(200000)` | 16 474 ms | **477 ms** | **35×** |
-| `pi(1000000)` | (did not finish in 6 min) | **4 041 ms** | — |
+| --- | ---: | ---: | ---: |
+| `pi(1000000)` | 4 208 ms | **1 114 ms** | **3.8×** |
+| `pi(200000)` | 280 ms | **171 ms** | 1.6× |
 
-That is where the time was. Everything below is measured after that fix.
+**2. Parallelising only the leaves of the conversion was nearly pointless.** The
+recursive splitter recomputed `10^h` from scratch at every node — ~900 ms of serial
+work for a 5.5-million-digit factorial, next to just 126 ms of parallel leaf
+conversion. The splitter now computes each level's power of ten once, computes all
+the levels' powers in parallel, and runs each level's divisions in parallel too.
 
-### Multithreading (`:threads N`, default = every core)
+Program-reported parallel fraction, 44 threads, before → after:
 
-GMP objects are never shared between threads; each task owns its own `mpz_class`.
-That is what makes this safe, since GMP is not internally synchronised.
-
-| Operation | How it is parallelised |
-| --- | --- |
-| `fact(n)` | product tree split into ~4×cores contiguous chunks, then combined pairwise |
-| `pi(d)` | Chudnovsky binary splitting cut into blocks; combining is `(P₁P₂, Q₁Q₂, Q₂T₁+P₁T₂)`, bit-identical to the sequential recursion |
-| `e(d)` | series split into blocks using `Σ N!/j! = (N!/hi!)·Σ hi!/j!` per block, tree-reduced |
-| decimal output > 2 M digits | divide-and-conquer split stays sequential, the leaf→ASCII step runs on all cores in batches |
-
-Xeon E5-2696 v4, 22 physical / 44 logical cores, best of 3:
-
-| operation | digits | 1 thread | 22 threads | 44 threads | 22× | 44× |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `fact(10⁶)` | 5 565 709 | 1 770 ms | 1 186 ms | 1 217 ms | 1.49× | 1.45× |
-| `pi(10⁶)` | 1 000 000 | 4 638 ms | 4 277 ms | 4 130 ms | 1.08× | **1.12×** |
-| `e(10⁶)` | 1 000 000 | 17 965 ms | 8 579 ms | 8 677 ms | **2.09×** | 2.07× |
-| `2^2·10⁷` (compute + render) | 6 020 600 | 1 452 ms | 1 100 ms | 1 163 ms | 1.32× | 1.25× |
-| `fib(3·10⁶)` (not parallelised) | 626 962 | 100 ms | 101 ms | 109 ms | 0.99× | 0.92× |
-
-**Why the numbers are modest, honestly.** These are binary-splitting trees, and
-the top of the tree is a *single* huge multiplication or division. With FFT
-multiplication each level up costs ~2.2× the one below, so the root is over half
-the total work — Amdahl caps `fact`/`pi` near 1.8× no matter how many cores you
-add. Going past that needs a *parallel* big-integer multiplier, which GMP does
-not have; that is a research-grade component, not a configuration knob. `e(d)`
-scales best because its per-block work is genuinely independent. More threads
-than physical cores (44 vs 22) buys nothing and occasionally costs a little.
-
-### CUDA (`:gpu`)
-
-An RTX 5060 Ti, driven **without the CUDA runtime**: nvcc compiles the kernel to
-PTX, `ptx_to_header.py` embeds it as a C string, and the executable resolves
-`nvcuda.dll` at run time and JITs it through the Driver API. The calculator stays
-a single MinGW-built binary with no import library and no MSVC-ABI DLL, and it
-builds and runs unchanged on machines with no CUDA Toolkit at all — it just
-reports the GPU as unavailable.
-
-**What belongs on the GPU, and what does not.** Arbitrary-precision arithmetic
-does not: the hot path is a chain of huge multiplications, GMP's speciality, and
-on a card that workload is latency- and bandwidth-bound rather than
-throughput-bound. What *is* embarrassingly parallel is screening one huge number
-against a very large table of small primes — millions of independent `n mod p`
-reductions with nothing flowing between them. That is the one kernel:
-
-```cuda
-// one thread per prime; Horner over the 32-bit limbs of the big number
-for (int j = nlimbs - 1; j >= 0; --j)
-    r = ((r << 32) | (unsigned)limbs[j]) % p;
+```
+fact(1000000)   10.3% -> 48.0%      2^100000000    2.0% -> 44.1%
+2^50000000       2.0% -> 42.3%      e(1000000)     2.3% ->  2.6%
 ```
 
-It backs `smallfactor(n[, limit])` and the screen in front of `isprime()` for
-inputs over 50 digits. A hit is a proof of compositeness, so it can only help.
+### Multithreading, measured
 
-Measured on `n = 2^521 − 1` (no small factor, so the whole prime table is swept):
+Xeon E5-2696 v4, 22 physical / 44 logical cores:
+
+| operation | 1 thread | 44 threads | speedup | parallel fraction |
+| --- | ---: | ---: | ---: | ---: |
+| `fact(10⁶)` | 1 823 ms | **752 ms** | **2.42×** | 48.0% |
+| `2^10⁸` (compute + render) | 9 497 ms | **3 576 ms** | **2.66×** | 44.1% |
+| `2^5·10⁷` | 4 125 ms | **1 699 ms** | **2.43×** | 42.3× |
+| `e(10⁶)` | 14 771 ms | **5 845 ms** | **2.53×** | 2.6% |
+| `pi(10⁶)` | 1 444 ms | **1 114 ms** | 1.30× | 7.7% |
+| `pi(2·10⁵)` | 184 ms | 171 ms | 1.08× | 18.7% |
+
+**Why `pi` stays near one core, honestly.** After the render fix, 86% of
+`pi(1000000)` is four *single* GMP operations that cannot overlap with anything:
+`10^1000015`, a 2 000 000-digit `mpz_sqrt`, and a 2 000 000-by-1 000 000 division.
+There is no second thread to give them work. `e` scales best because its per-block
+work is genuinely independent — and part of that 2.53× is algorithmic, not threading:
+the parallel path evaluates `Σ hi!/j!` per block with a product tree instead of a
+running product.
+
+### GPU (CUDA) — what it can and cannot do here
+
+An RTX 5060 Ti, driven **without the CUDA runtime**: nvcc compiles
+`gpu_screen.cu` to PTX, `ptx_to_header.py` embeds it as a C string, and the
+executable resolves `nvcuda.dll` at run time and JITs it through the Driver API.
+Still one MinGW-built binary, no import library, no MSVC-ABI DLL, and it runs
+unchanged on machines with no CUDA Toolkit.
+
+**It cannot accelerate the arithmetic, and this is not a matter of effort.** The hot
+path of every operation here is a chain of enormous multiplications and divisions.
+GMP has a hand-tuned FFT for those; on a GPU that workload is latency- and
+bandwidth-bound, not throughput-bound. Making `fact`/`pi`/`2^n` faster on the GPU
+would need a parallel big-integer multiplier — a research-grade component.
+
+**What it does accelerate** is the one embarrassingly parallel shape in the program:
+one huge number against a very large table of small primes, `n mod p` for each,
+nothing flowing between them. That backs `smallfactor(n[, limit])`:
 
 | limit | GPU | 44-thread CPU | speedup |
 | --- | ---: | ---: | ---: |
 | 10⁶ | 1.24 ms | 9.17 ms | **7.4×** |
 | 10⁷ | 2.34 ms | 10.15 ms | **4.3×** |
-| 4×10⁷ | 5.36 ms | 14.21 ms | **2.7×** |
 | 10⁸ | 8.43 ms | 23.09 ms | **2.7×** |
+
+**What it does not accelerate, and I am not shipping it as if it did.** A GPU
+candidate-window sieve for `nextprime` was written, verified to return identical
+results, and then **rejected on measurement** — it loses to `mpz_nextprime` at every
+size tried, while the kernel itself contributes under a millisecond:
+
+| n | GPU window sieve | `mpz_nextprime` |
+| --- | ---: | ---: |
+| 10³⁰⁰ | 259 ms | **14 ms** |
+| 10²⁰⁰⁰ | 14.7 s | **13.5 s** |
+| 10⁸⁰⁰⁰ | 516 s | **402 s** |
+
+The cost is Miller-Rabin on the survivors, not the small-prime screen, and GMP
+already screens candidates well. It stays behind `:gpu nextprime on` for
+experiments, off by default.
 
 `smallfactor` cross-checked against an independent Python reference on 71 inputs
 (including `2^521−1`, `2^127−1`, `2^89−1`, `10^200+357`): **0 mismatches**.
 
-### New commands
+### Commands
 
 ```text
-:threads N        worker threads (no arg = show, 0 = auto)
-:gpu              on|off|info|bench [limit]
+:threads N            worker threads (no arg = show, 0 = auto)
+:gpu                  on|off|info|nextprime|bench [limit]
+:time                 now also reports the parallel fraction and GPU kernel ms
 ```
+
+`:time` output looks like this, so the split is never a mystery:
+
+```
+  [752.3 ms  | parallel regions: 15 calls, 481 tasks, 359.2 ms wall on 44
+   threads = 48.0% of the run  | GPU kernels: 0.0 ms]
+```
+
+### Verification (after a clean `build.cmd`)
+
+| Check | Result |
+| --- | --- |
+| 29-case Python-oracle suite | 0 / 29 |
+| 599 decimal/rounding outputs vs an independent half-up reference | 0 mismatches |
+| `smallfactor` vs an independent Python reference, 71 inputs | 0 mismatches |
+| `2^1000000`, `2^10000000`, `fact(1000000)` vs CPython | byte-for-byte |
+| compiler warnings with `-Wall -Wextra` | 0 |
 
 ---
 
